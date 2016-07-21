@@ -9,6 +9,7 @@
 #include <net/if.h> 
 #include <string.h>
 #include <pthread.h>
+#include <unistd.h>
 
 int get_local_mac(char* buffer, int buf_size){
   struct ifreq ifr;
@@ -246,7 +247,7 @@ void* t_capture_filter_arp(void* data){
   dev = pcap_lookupdev(errbuf);
   if(dev == NULL){
     fprintf(stderr, "[DEBUG] Could not find default device: %s\n", errbuf);
-    return(2);
+    return NULL;
   }
 
   if(pcap_lookupnet(dev, &net, &mask, errbuf) == -1){
@@ -258,23 +259,23 @@ void* t_capture_filter_arp(void* data){
   handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
   if(handle == NULL){
     fprintf(stderr, "[DEBUG] Could not open device %s: %s\n", dev, errbuf);
-    return(2);
+    return NULL;
   }
 
   char* filter_exp = "";
   if(pcap_compile(handle, &fp, filter_exp, 0, net) == -1){
     fprintf(stderr, "[DEBUG] Could not parse filter %s: %s\n", filter_exp, pcap_geterr(handle));
-    return(2);
+    return NULL;
   }
 
   if(pcap_setfilter(handle, &fp) == -1){
     fprintf(stderr, "[DEBUG] Could not install filter %s: %s\n", filter_exp, pcap_geterr(handle));
-    return(2);
+    return NULL;
   }
 
   while(1){
     if((packet = pcap_next(handle, &header)) == NULL){
-      fprintf(stderr, "[DEBUG] Getting the packet error. retry...\n", errbuf);
+      fprintf(stderr, "[DEBUG] Getting the packet error. retry...\n");
     }else{
       arphdr = (struct ether_arp*)(packet + 14);
       if(ntohs(arphdr->arp_op) == 0x0002){  // if arp replay
@@ -320,7 +321,7 @@ int get_remote_mac(char* buffer, int buffer_size, char* interface, unsigned char
 
   // return arp result
   memcpy((unsigned char*)buffer, (unsigned char*)result, 6);
-  free(result);
+  free((void*)result);
   return 1;
 }
 
@@ -347,7 +348,7 @@ int get_localhost_ip(char* buffer, char* interface){
 
   fd = socket(AF_INET, SOCK_DGRAM, 0);
   ifr.ifr_addr.sa_family = AF_INET;
-  snprintf(ifr.ifr_name, IFNAMSIZ, interface);
+  memcpy(ifr.ifr_name, interface, IFNAMSIZ);
   ioctl(fd, SIOCGIFADDR, &ifr);
   close(fd);
   strncpy(buffer, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr), 16);
